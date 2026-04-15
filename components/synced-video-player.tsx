@@ -198,6 +198,19 @@ const StartScreen = ({
 }) => {
   const isMobile = useMediaQuery('(max-width: 640px)')
   const isTablet = useMediaQuery('(min-width: 641px) and (max-width: 1024px)')
+  const startTapLockRef = useRef(false)
+
+  const triggerStart = useCallback(() => {
+    if (isStartDisabled || startTapLockRef.current) return
+
+    startTapLockRef.current = true
+    onPlayClick()
+
+    // Prevent rapid double taps from racing iOS gesture/start state.
+    setTimeout(() => {
+      startTapLockRef.current = false
+    }, 450)
+  }, [isStartDisabled, onPlayClick])
 
   const handleScreenPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!allowScreenTapStart || isStartDisabled) return
@@ -206,7 +219,7 @@ const StartScreen = ({
     const target = event.target as HTMLElement | null
     if (target?.closest('[data-start-trigger="true"]')) return
 
-    onPlayClick()
+    triggerStart()
   }
   
   return (
@@ -318,9 +331,11 @@ const StartScreen = ({
               data-start-trigger="true"
               onClick={(event) => {
                 event.stopPropagation()
-                if (!isStartDisabled) {
-                  onPlayClick()
-                }
+                triggerStart()
+              }}
+              onPointerUp={(event) => {
+                event.stopPropagation()
+                triggerStart()
               }}
               disabled={isStartDisabled}
               size={isMobile ? 'default' : 'lg'}
@@ -799,7 +814,19 @@ export function SyncedVideoPlayer({
   const iosAudioUnlockedRef = useRef(false)
   const iosUnmuteRetryRef = useRef(false)
   const startInProgressRef = useRef(false)
+  const hasPressedStartRef = useRef(false)
+  const startWantsUnmuteRef = useRef(false)
   const pendingStartTapRef = useRef(false)
+  const isLoadingRef = useRef(false)
+  const playerReadyRef = useRef(false)
+  const iframeVisibleRef = useRef(false)
+  const showStartScreenRef = useRef(false)
+  const apiErrorRef = useRef<string | null>(null)
+  const brandedOverlayHideTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const playbackStartWatchdogRef = useRef<NodeJS.Timeout | null>(null)
+  const playbackRecoveryAttemptRef = useRef(0)
+  const currentLoadAttemptRef = useRef(0)
+  const channelLoadTimeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   const isMobile = useMediaQuery('(max-width: 768px)')
   const isTablet = useMediaQuery('(min-width: 769px) and (max-width: 1024px)')
@@ -837,6 +864,7 @@ export function SyncedVideoPlayer({
     setMuted: setYouTubeMuted,
     seekTo,
     getCurrentTime,
+    getIsMuted,
     play,
     destroy
   } = useYouTubePlayer()
@@ -872,10 +900,44 @@ export function SyncedVideoPlayer({
   // without being in its dependency array (which would reset the 5-min interval)
   useEffect(() => { currentProgramRef.current = currentProgram }, [currentProgram])
   useEffect(() => { upcomingVideosRef.current = upcomingVideos }, [upcomingVideos])
+  useEffect(() => { isLoadingRef.current = isLoading }, [isLoading])
+  useEffect(() => { playerReadyRef.current = playerReady }, [playerReady])
+  useEffect(() => { iframeVisibleRef.current = iframeVisible }, [iframeVisible])
+  useEffect(() => { showStartScreenRef.current = showStartScreen }, [showStartScreen])
+  useEffect(() => { apiErrorRef.current = apiError }, [apiError])
+
+  const clearPlaybackStartWatchdog = useCallback(() => {
+    if (playbackStartWatchdogRef.current) {
+      clearTimeout(playbackStartWatchdogRef.current)
+      playbackStartWatchdogRef.current = null
+    }
+  }, [])
+
+  const clearBrandedOverlayHideTimeout = useCallback(() => {
+    if (brandedOverlayHideTimeoutRef.current) {
+      clearTimeout(brandedOverlayHideTimeoutRef.current)
+      brandedOverlayHideTimeoutRef.current = null
+    }
+  }, [])
+
+  const hideBrandedOverlayAfterDelay = useCallback((delayMs: number = 3500) => {
+    clearBrandedOverlayHideTimeout()
+    brandedOverlayHideTimeoutRef.current = setTimeout(() => {
+      if (!mountedRef.current) return
+      setShowBrandedOverlay(false)
+    }, delayMs)
+  }, [clearBrandedOverlayHideTimeout])
+
+  const clearChannelLoadTimeout = useCallback(() => {
+    if (channelLoadTimeoutRef.current) {
+      clearTimeout(channelLoadTimeoutRef.current)
+      channelLoadTimeoutRef.current = null
+    }
+  }, [])
 
   // iOS only: keep start screen with explicit user gesture.
   useEffect(() => {
-    setShowStartScreen(isIOS)
+    setShowStartScreen(isIOS && !hasPressedStartRef.current)
     if (!isIOS) {
       setIosPrimerReady(true)
     }
@@ -1158,7 +1220,12 @@ export function SyncedVideoPlayer({
       }
 
       console.log('📡 Browser → External API:', apiUrl)
-      const data = await clientFetchWithAuth(apiUrl)
+      const data: any = await Promise.race([
+        clientFetchWithAuth(apiUrl),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('External API timeout')), 10000)
+        }),
+      ])
 
       // Normalise the response shape coming from the real API
       const curr = data?.currentProgram || data?.current || data?.data?.currentProgram
@@ -1286,10 +1353,39 @@ export function SyncedVideoPlayer({
   // Keep the ref in sync with the latest closure
   useEffect(() => { syncImmediateAfterTransitionRef.current = syncImmediateAfterTransition }, [syncImmediateAfterTransition])
 
-  const loadChannel = useCallback(async (channelId: string, options?: { preferUnmutedStart?: boolean }) => {
-    if (isLoading) return
+  const loadChannel = useCallback(async (channelId: string, options?: { preferUnmutedStart?: boolean; isRecoveryRetry?: boolean }) => {
+    const loadAttemptId = currentLoadAttemptRef.current + 1
+    currentLoadAttemptRef.current = loadAttemptId
+    const isStaleLoadAttempt = () => !mountedRef.current || currentLoadAttemptRef.current !== loadAttemptId
 
-    const shouldStartUnmuted = Boolean(options?.preferUnmutedStart && isIOS && iosAudioUnlockedRef.current)
+    clearPlaybackStartWatchdog()
+    clearChannelLoadTimeout()
+
+    channelLoadTimeoutRef.current = setTimeout(() => {
+      if (!mountedRef.current) return
+      if (currentLoadAttemptRef.current !== loadAttemptId) return
+      if (playerReadyRef.current || iframeVisibleRef.current) return
+
+      console.warn('⚠️ Channel load timeout: recovering without reopening Start screen')
+      startInProgressRef.current = false
+      setIsLoading(false)
+      setShowBrandedOverlay(false)
+      setApiError(null)
+      setShowStartScreen(false)
+
+      if (isIOS) {
+        primePlayer().catch(() => {})
+      }
+    }, 20000)
+
+    if (!options?.isRecoveryRetry) {
+      playbackRecoveryAttemptRef.current = 0
+    }
+
+    const shouldStartUnmuted = Boolean(options?.preferUnmutedStart)
+    if (shouldStartUnmuted && isIOS) {
+      iosAudioUnlockedRef.current = true
+    }
     iosUnmuteRetryRef.current = false
     
     setIsLoading(true)
@@ -1323,12 +1419,16 @@ export function SyncedVideoPlayer({
       // 2️⃣ Fallback to our own Next.js API route (local schedule data)
       if (!result) {
         console.log('📋 Falling back to local /api/current-video route...')
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 10000)
         const response = await fetch(`/api/current-video?channel=${channelId}`, {
           headers: { 
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache'
-          }
+          },
+          signal: controller.signal,
         })
+        clearTimeout(timeoutId)
         
         if (!response.ok) {
           throw new Error(`API error: ${response.status}`)
@@ -1341,6 +1441,8 @@ export function SyncedVideoPlayer({
       if (!result.serverTime || !result.currentProgram) {
         throw new Error('Invalid API response')
       }
+
+      if (isStaleLoadAttempt()) return
       
       const offset = result.serverTime - clientTime
       setServerTimeOffset(offset)
@@ -1365,6 +1467,7 @@ export function SyncedVideoPlayer({
 
       setIsLoading(false)
       setShowStartScreen(false)
+      clearBrandedOverlayHideTimeout()
       setShowBrandedOverlay(true)
       setCurrentProgram(program)
       setCurrentTime(startTime)
@@ -1442,7 +1545,9 @@ export function SyncedVideoPlayer({
       lastVideoIdRef.current = program.videoId
       
       const startPlayback = () => {
+        if (isStaleLoadAttempt()) return
         console.log('✅ Player ready - starting playback')
+        clearChannelLoadTimeout()
         setPlayerReady(true)
         setIsLoading(false)
         setShowStartScreen(false)
@@ -1464,10 +1569,98 @@ export function SyncedVideoPlayer({
           setYouTubeMuted(true)
           setIsMuted(true)
         }
+
+        const enforceUnmutedPlayback = (attempt: number = 0) => {
+          if (!shouldStartUnmuted) return
+          if (!mountedRef.current || isStaleLoadAttempt()) return
+
+          unmuteAndResume(volume)
+          setYouTubeMuted(false)
+          setIsMuted(false)
+
+          if (!getIsMuted()) return
+          if (attempt >= 4) return
+
+          const delay = attempt === 0 ? 120 : 280
+          setTimeout(() => enforceUnmutedPlayback(attempt + 1), delay)
+        }
+
+        enforceUnmutedPlayback(0)
+
+        // Some iOS/Safari sessions play video but miss PLAYING callback.
+        // If time progresses, force-restore visuals to avoid black-screen hang.
+        const recoverVisualPlaybackIfNeeded = () => {
+          if (!mountedRef.current) return
+          if (currentLoadAttemptRef.current !== loadAttemptId) return
+          if (iframeVisibleRef.current) return
+
+          const progress = getCurrentTime()
+          if (progress > 0.1) {
+            console.log('✅ Playback progress detected without PLAYING callback; restoring visuals')
+            setIframeVisible(true)
+            setIsLoading(false)
+            hideBrandedOverlayAfterDelay(3500)
+            clearPlaybackStartWatchdog()
+            playbackRecoveryAttemptRef.current = 0
+          }
+        }
+
+        setTimeout(recoverVisualPlaybackIfNeeded, 1500)
+        setTimeout(recoverVisualPlaybackIfNeeded, 3200)
+
+        // Some Safari/iOS reloads miss PLAYING callbacks; watchdog recovers once.
+        clearPlaybackStartWatchdog()
+        playbackStartWatchdogRef.current = setTimeout(() => {
+          if (!mountedRef.current) return
+          if (currentLoadAttemptRef.current !== loadAttemptId) return
+          if (playerReadyRef.current && iframeVisibleRef.current) return
+
+          const progress = getCurrentTime()
+          if (progress > 0.1) {
+            console.log('✅ Watchdog found active playback; restoring visuals without reload')
+            setIframeVisible(true)
+            setIsLoading(false)
+            hideBrandedOverlayAfterDelay(3500)
+            playbackRecoveryAttemptRef.current = 0
+            clearPlaybackStartWatchdog()
+            return
+          }
+
+          console.warn('⚠️ Startup watchdog fired: forcing one recovery reload')
+          setShowStartScreen(false)
+          setIsLoading(false)
+          setShowBrandedOverlay(true)
+          play()
+
+          if (playbackRecoveryAttemptRef.current >= 1) {
+            clearBrandedOverlayHideTimeout()
+            setShowBrandedOverlay(false)
+            setApiError('Playback is taking longer than expected. Please tap Refresh.')
+            return
+          }
+
+          playbackRecoveryAttemptRef.current += 1
+
+          // Hard reset stale iframe/API state before retrying the same channel.
+          try {
+            destroy()
+          } catch (_) {}
+          setIframeVisible(false)
+          setPlayerReady(false)
+
+          setTimeout(() => {
+            if (!mountedRef.current) return
+            if (currentLoadAttemptRef.current !== loadAttemptId) return
+            loadChannel(channelId, {
+              preferUnmutedStart: shouldStartUnmuted,
+              isRecoveryRetry: true,
+            })
+          }, 900)
+        }, 12000)
       }
 
       const onPlayerStateChange = (state: number) => {
-        if (!mountedRef.current) return
+        if (isStaleLoadAttempt()) return
 
         console.log('🎬 YouTube state changed:', state)
 
@@ -1482,19 +1675,28 @@ export function SyncedVideoPlayer({
           playNextVideoRef.current()
         } else if (state === YT_STATE.PLAYING) {
           console.log('▶️ Video is now playing')
+          clearPlaybackStartWatchdog()
+          playbackRecoveryAttemptRef.current = 0
 
-          if (isIOS && shouldStartUnmuted && !iosUnmuteRetryRef.current) {
+          if (shouldStartUnmuted && !iosUnmuteRetryRef.current) {
             iosUnmuteRetryRef.current = true
             unmuteAndResume(volume)
             setYouTubeMuted(false)
             setIsMuted(false)
+
+            if (getIsMuted()) {
+              setTimeout(() => {
+                if (!mountedRef.current || isStaleLoadAttempt()) return
+                unmuteAndResume(volume)
+                setYouTubeMuted(false)
+                setIsMuted(false)
+              }, 220)
+            }
           }
 
           setIsLoading(false)
           setIframeVisible(true)
-          setTimeout(() => {
-            setShowBrandedOverlay(false)
-          }, 3000)
+          hideBrandedOverlayAfterDelay(3500)
         } else if (state === YT_STATE.PAUSED) {
           console.log('⏸️ Video paused - resuming')
           play()
@@ -1514,7 +1716,12 @@ export function SyncedVideoPlayer({
       }
 
       const onPlayerError = (code: number, msg: string) => {
+        if (isStaleLoadAttempt()) return
         console.error('Player error:', code, msg)
+        clearChannelLoadTimeout()
+        clearPlaybackStartWatchdog()
+        clearBrandedOverlayHideTimeout()
+        setShowBrandedOverlay(false)
         if (code === 2 || code === 5 || code === 100) {
           setApiError(`Playback error: ${msg}`)
           setIsLoading(false)
@@ -1525,6 +1732,7 @@ export function SyncedVideoPlayer({
       }
 
       if (isIOS && isPrimedRef.current) {
+        if (isStaleLoadAttempt()) return
         // Reuse the already-primed iOS player instance to preserve audio unlock.
         setPlayerCallbacks({
           onStateChange: onPlayerStateChange,
@@ -1543,6 +1751,7 @@ export function SyncedVideoPlayer({
 
         startPlayback()
       } else {
+        if (isStaleLoadAttempt()) return
         await initializePlayer({
           videoId: program.videoId,
           startSeconds: Math.floor(startTime),
@@ -1558,36 +1767,76 @@ export function SyncedVideoPlayer({
       }
       
     } catch (error) {
+      if (isStaleLoadAttempt()) return
       console.error('API call failed:', error)
+      clearChannelLoadTimeout()
+      clearPlaybackStartWatchdog()
+      clearBrandedOverlayHideTimeout()
+      setShowBrandedOverlay(false)
       setApiError(error instanceof Error ? error.message : 'Failed to load video')
       setIsLoading(false)
+    } finally {
+      if (!isStaleLoadAttempt()) {
+        clearChannelLoadTimeout()
+      }
     }
-  }, [isLoading, volume, isIOS, initializePlayer, loadVideo, seekTo, play, setYouTubeVolume, setYouTubeMuted, onChannelChange, onStartClick, getDuration, fetchFromBrowserAPI, notifyParentScheduleChange, isPrimedRef, setPlayerCallbacks, unmuteAndResume])
+  }, [volume, isIOS, initializePlayer, loadVideo, seekTo, play, setYouTubeVolume, setYouTubeMuted, onChannelChange, onStartClick, getDuration, getCurrentTime, getIsMuted, fetchFromBrowserAPI, notifyParentScheduleChange, isPrimedRef, setPlayerCallbacks, unmuteAndResume, destroy, clearPlaybackStartWatchdog, clearBrandedOverlayHideTimeout, hideBrandedOverlayAfterDelay, clearChannelLoadTimeout, primePlayer])
 
-  const handleFirstTimeStart = useCallback(() => {
-    if (isLoading || startInProgressRef.current) return
+  const handleFirstTimeStart = useCallback((opts?: { deferredFromPrimerReady?: boolean }) => {
+    const isDeferredStart = opts?.deferredFromPrimerReady === true
+
+    if (startInProgressRef.current) return
+
+    // For deferred iOS starts, the state->ref sync for isLoading can lag by one
+    // tick. Let deferred starts continue instead of being dropped (black screen).
+    if (!isDeferredStart && isLoadingRef.current) return
+    if (isDeferredStart && isLoadingRef.current) {
+      isLoadingRef.current = false
+      setIsLoading(false)
+    }
+
+    // Once user presses Start, do not show Start screen again in this page session.
+    hasPressedStartRef.current = true
+    // User intent: pressing Start means playback should begin with sound.
+    startWantsUnmuteRef.current = true
 
     let unlockReady = false
 
     if (isIOS) {
       if (!iosPrimerReady || !isPrimedRef.current) {
-        // Keep the first tap intent so it can auto-start as soon as primer is ready.
+        // Keep Start screen visible until primer is ready. Avoid auto-starting
+        // outside a fresh gesture, which can fail on iOS Safari after reload.
         pendingStartTapRef.current = true
+        setShowStartScreen(false)
+        // Give immediate feedback that the tap was accepted while primer finishes.
+        setIsLoading(true)
+        clearBrandedOverlayHideTimeout()
+        setShowBrandedOverlay(false)
         primePlayer()
         return
       }
 
       pendingStartTapRef.current = false
 
-      // Keep this synchronous in the tap event to satisfy iOS audio gesture rules.
-      unlockReady = isPrimedRef.current
-      iosAudioUnlockedRef.current = unlockReady
-
-      if (unlockReady) {
-        unmuteAndResume(volume)
+      // Deferred start keeps the user's unmute intent; runtime retries during
+      // playback will enforce unmute even if this call is outside direct gesture.
+      if (opts?.deferredFromPrimerReady) {
+        unlockReady = startWantsUnmuteRef.current
+        iosAudioUnlockedRef.current = unlockReady
+        if (unlockReady) {
+          unmuteAndResume(volume)
+        }
       } else {
-        // Best-effort: if primer wasn't ready yet, start creating it now.
-        primePlayer()
+        // Keep this synchronous in the tap event to satisfy iOS audio gesture rules.
+        unlockReady = isPrimedRef.current
+        iosAudioUnlockedRef.current = unlockReady
+
+        if (unlockReady) {
+          unmuteAndResume(volume)
+        } else {
+          // Best-effort: if primer wasn't ready yet, start creating it now.
+          primePlayer()
+        }
       }
     }
 
@@ -1643,23 +1892,50 @@ export function SyncedVideoPlayer({
       setIsLoading(true)
       loadChannel(currentChannelId, { preferUnmutedStart: unlockReady }).finally(completeStartAttempt)
     }
-  }, [currentChannelId, iosPrimerReady, isIOS, isLoading, isPrimedRef, loadChannel, primePlayer, unmuteAndResume, volume])
+  }, [currentChannelId, iosPrimerReady, isIOS, isPrimedRef, loadChannel, primePlayer, unmuteAndResume, volume, clearBrandedOverlayHideTimeout])
 
-  // If user tapped while iOS primer was still initializing, auto-start when ready.
+  // If the first Start click happened before iOS primer became ready, continue
+  // automatically once primer is ready (no second click required).
   useEffect(() => {
     if (!isIOS) return
     if (!pendingStartTapRef.current) return
     if (!iosPrimerReady || !isPrimedRef.current) return
-    if (isLoading || startInProgressRef.current) return
+    if (startInProgressRef.current) return
 
     pendingStartTapRef.current = false
-    handleFirstTimeStart()
-  }, [handleFirstTimeStart, iosPrimerReady, isIOS, isLoading, isPrimedRef])
+    // Clear the temporary loading guard, then continue the already-requested start.
+    setIsLoading(false)
+    setTimeout(() => {
+      if (!mountedRef.current) return
+      handleFirstTimeStart({ deferredFromPrimerReady: true })
+    }, 0)
+  }, [iosPrimerReady, isIOS, isPrimedRef, handleFirstTimeStart])
+
+  // iOS guard: never leave a blank/black frame while waiting for first visible frame.
+  useEffect(() => {
+    if (!isIOS) return
+    if (showStartScreen || isLoading || apiError) return
+    if (!playerReady) return
+    if (iframeVisible) return
+    if (showBrandedOverlay) return
+
+    setShowBrandedOverlay(true)
+  }, [isIOS, showStartScreen, isLoading, apiError, playerReady, iframeVisible, showBrandedOverlay])
 
   const handleSelectChannel = useCallback((channelId: string) => {
     setShowChannelSelector(false)
-    loadChannel(channelId)
-  }, [loadChannel])
+
+    // Channel change is an explicit user gesture; keep audio ON.
+    if (isIOS) {
+      iosAudioUnlockedRef.current = true
+      unmuteAndResume(volume)
+    }
+
+    setIsMuted(false)
+    setYouTubeMuted(false)
+    hasAutoUnmutedRef.current = true
+    loadChannel(channelId, { preferUnmutedStart: true })
+  }, [isIOS, loadChannel, setYouTubeMuted, unmuteAndResume, volume])
 
   const handleOpenChannelSelector = useCallback(async () => {
     // First, show the modal with current channels
@@ -1858,6 +2134,16 @@ export function SyncedVideoPlayer({
   const handleReload = useCallback(() => {
     if (!currentChannelId) return
     console.log('🔄 Reloading channel:', currentChannelId)
+    clearPlaybackStartWatchdog()
+    clearBrandedOverlayHideTimeout()
+    playbackRecoveryAttemptRef.current = 0
+
+    const preferUnmutedStart = true
+
+    if (isIOS) {
+      iosAudioUnlockedRef.current = true
+      unmuteAndResume(volume)
+    }
     
     // Save currently-playing video to history BEFORE reload so it appears in the list
     if (currentProgram) {
@@ -1866,42 +2152,24 @@ export function SyncedVideoPlayer({
     }
     
     // Reset player state only — do NOT touch previousVideos or localStorage
+    destroy()
     setPlayerReady(false)
     setCurrentProgram(null)
     setApiError(null)
     setIframeVisible(false) // hide iframe until next real PLAYING event
-    // Reset mute state to true (start muted again)
-    setIsMuted(true)
-    setYouTubeMuted(true)
+    setShowStartScreen(false)
+    // Reload action should continue with sound enabled.
+    setIsMuted(false)
+    setYouTubeMuted(false)
     setShowAutoUnmuteNotification(false)
-    hasAutoUnmutedRef.current = false
-
-    if (isIOS) {
-      // iOS requirement: reload should behave like fresh page load and require
-      // an explicit unmute/start gesture from the start screen.
-      setShowStartScreen(true)
-      setIsLoading(false)
-      setShowBrandedOverlay(false)
-      iosAudioUnlockedRef.current = false
-      iosUnmuteRetryRef.current = false
-      startInProgressRef.current = false
-      pendingStartTapRef.current = false
-
-      destroy()
-      setIosPrimerReady(false)
-      primePlayer().finally(() => {
-        if (mountedRef.current && isPrimedRef.current) {
-          setIosPrimerReady(true)
-        }
-      })
-      return
-    }
+    hasAutoUnmutedRef.current = true
     
-    // Reload same channel — previousVideos state and localStorage are preserved
+    // Reload same channel — previousVideos state and localStorage are preserved.
+    // For iOS, keep wrapper reload flow without showing the start screen again.
     setTimeout(() => {
-      loadChannel(currentChannelId)
+      loadChannel(currentChannelId, { preferUnmutedStart })
     }, 200)
-  }, [currentChannelId, currentProgram, destroy, isIOS, isPrimedRef, loadChannel, primePlayer, setYouTubeMuted])
+  }, [currentChannelId, currentProgram, isIOS, loadChannel, setYouTubeMuted, unmuteAndResume, destroy, volume, clearPlaybackStartWatchdog, clearBrandedOverlayHideTimeout])
 
   // Auto-start on web/android. iOS waits for explicit Start button click.
   useEffect(() => {
@@ -2081,6 +2349,15 @@ export function SyncedVideoPlayer({
       if (autoUnmuteTimerRef.current) {
         clearTimeout(autoUnmuteTimerRef.current)
       }
+      if (brandedOverlayHideTimeoutRef.current) {
+        clearTimeout(brandedOverlayHideTimeoutRef.current)
+      }
+      if (channelLoadTimeoutRef.current) {
+        clearTimeout(channelLoadTimeoutRef.current)
+      }
+      if (playbackStartWatchdogRef.current) {
+        clearTimeout(playbackStartWatchdogRef.current)
+      }
     }
   }, [])
 
@@ -2132,6 +2409,8 @@ export function SyncedVideoPlayer({
   }, [isMobile])
 
   const handleActivity = useCallback(() => {
+    if (showStartScreenRef.current || isLoadingRef.current || !!apiErrorRef.current) return
+
     setControlsVisible(true)
     setShowControls(true)
     if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current)
@@ -2142,6 +2421,8 @@ export function SyncedVideoPlayer({
   }, [])
 
   useEffect(() => {
+    if (showStartScreen || isLoading || !!apiError) return
+
     const el = playerRef.current
     if (el) {
       el.addEventListener('mousemove', handleActivity)
@@ -2151,7 +2432,7 @@ export function SyncedVideoPlayer({
         el.removeEventListener('touchstart', handleActivity)
       }
     }
-  }, [handleActivity])
+  }, [handleActivity, showStartScreen, isLoading, apiError])
 
   const isLastInCycle = currentProgram && cycleInfo.total ? cycleInfo.current === cycleInfo.total : false
 
@@ -2189,9 +2470,9 @@ export function SyncedVideoPlayer({
             <StartScreen
               onPlayClick={handleFirstTimeStart}
               isStartDisabled={false}
-              allowScreenTapStart={isIOS}
+              allowScreenTapStart={false}
               buttonLabel={isIOS ? 'Start Watching' : 'Start Watching'}
-              helperText={isIOS ? 'Tap anywhere to start with audio' : 'Click to start your spiritual journey'}
+              helperText={isIOS ? 'Tap Start Watching to start with audio' : 'Click to start your spiritual journey'}
             />
           )}
 
@@ -2428,9 +2709,7 @@ export function SyncedVideoPlayer({
 
         {/* Bottom Controls - OUTSIDE video frame - ALWAYS VISIBLE - Unified with iframe */}
         <div className="w-full">
-          <div className={`bg-black/60 backdrop-blur-xl border border-white/10 border-t-0 rounded-b-2xl md:rounded-b-3xl ${
-              isMobile ? 'px-3 py-1.5' : 'px-6 py-2.5'
-          }`}>
+          <div className="bg-black/60 backdrop-blur-xl border border-white/10 border-t-0 rounded-b-2xl md:rounded-b-3xl px-6 py-4">
             <div className="flex items-center justify-between gap-2 md:gap-4">
                     {/* Logo Section - Replaces sound bar */}
               <div className="flex items-center gap-2 flex-shrink-0">
