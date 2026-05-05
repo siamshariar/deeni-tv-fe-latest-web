@@ -2920,7 +2920,7 @@ export function SyncedVideoPlayer({
       variant="ghost"
       size="icon"
       onClick={() => !isVolumeControlsLocked && toggleMute()}
-      className={`text-white/90 hover:bg-white/20 rounded-full backdrop-blur-sm border bg-white/10 border-white/20 ${
+      className={`text-white/90 hover:text-white hover:bg-white/20 rounded-full backdrop-blur-sm border bg-white/10 border-white/20 ${
         isVolumeControlsLocked ? 'pointer-events-none' : ''
       } ${
         isMobile ? 'h-7 w-7' : 'h-9 w-9'
@@ -2968,7 +2968,7 @@ export function SyncedVideoPlayer({
                       variant="ghost"
                       size="icon"
                       onClick={item.onClick}
-                      className={`text-white/90 hover:bg-white/20 rounded-full bg-white/10 backdrop-blur-sm border border-white/20 ${
+                      className={`text-white/90 hover:text-white hover:bg-white/20 rounded-full bg-white/10 backdrop-blur-sm border border-white/20 ${
                         isMobile ? 'h-7 w-7' : 'h-9 w-9'
                       }`}
                       title={item.title}

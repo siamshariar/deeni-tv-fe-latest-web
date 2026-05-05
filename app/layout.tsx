@@ -3,7 +3,6 @@ import type { Metadata, Viewport } from 'next'
 import { Geist, Geist_Mono } from 'next/font/google'
 import { Analytics } from '@vercel/analytics/next'
 import GoogleAnalytics from '../components/google-analytics'
-import { NativeShell } from '../components/native-shell'
 import './globals.css'
 
 const geist = Geist({ 
@@ -141,7 +140,6 @@ export default function RootLayout({
         style={{ backgroundColor: '#09090b' }}
         suppressHydrationWarning={true}
       >
-        <NativeShell />
         <div id="root">
           {children}
         </div>
