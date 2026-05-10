@@ -2982,7 +2982,6 @@ export function SyncedVideoPlayer({
         </div>
       </div>
 
-      {/* Channel Selector Modal */}
       <ChannelSelectorModal
         isOpen={showChannelSelector}
         onClose={() => { setShowChannelSelector(false); onChannelSelectorModalClose?.() }}
